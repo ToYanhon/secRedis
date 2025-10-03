@@ -5,6 +5,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <netdb.h>
 
 class TcpClient {
 public:
@@ -24,10 +25,15 @@ public:
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port_);
 
-    if (inet_pton(AF_INET, host_.c_str(), &server_addr.sin_addr) <= 0) {
-      std::cerr << "Invalid address/Address not supported" << std::endl;
+    // 解析主机名
+    struct hostent *he = gethostbyname(host_.c_str());
+    if (he == nullptr) {
+      std::cerr << "Failed to resolve hostname: " << host_ << std::endl;
       return false;
     }
+    
+    // 复制IP地址
+    memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
 
     if (::connect(sockfd_, (struct sockaddr *)&server_addr,
                   sizeof(server_addr)) < 0) {

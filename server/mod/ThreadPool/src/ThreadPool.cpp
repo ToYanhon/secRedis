@@ -1,17 +1,14 @@
 #include "ThreadPool/ThreadPool.hpp"
 
-#include "MutexGuard/MutexGuard.hpp"
-
 namespace yanhon {
 
 ThreadPool::ThreadPool(int num_threads)
     : num_threads(num_threads), stop_flag(false), task_queue_head(nullptr),
       task_queue_tail(nullptr) {
-  threads = new pthread_t[num_threads];
-  pthread_mutex_init(&queue_mutex, nullptr);
 
+  threads = new std::thread[num_threads];
   for (int i = 0; i < num_threads; ++i) {
-    pthread_create(&threads[i], nullptr, worker, this);
+    threads[i] = std::thread(ThreadPool::worker, this);
   }
 }
 
@@ -23,7 +20,7 @@ void ThreadPool::enqueue(std::function<void()> task) {
 
   TaskNode *new_task = new TaskNode{std::move(task), nullptr, nullptr};
 
-  MutexGuard lock(queue_mutex);
+  std::lock_guard lock(queue_mutex);
   if (task_queue_tail) {
     task_queue_tail->next = new_task;
     task_queue_tail = new_task;
@@ -35,10 +32,9 @@ void ThreadPool::enqueue(std::function<void()> task) {
 
 void ThreadPool::stop() {
   stop_flag = true;
-  condition_var.notify_all();
-
+  std::unique_lock lock(queue_mutex);
   for (int i = 0; i < num_threads; ++i) {
-    pthread_join(threads[i], nullptr);
+    threads[i].join();
   }
 
   delete[] threads;
@@ -56,11 +52,11 @@ void *ThreadPool::worker(void *arg) {
   while (true) {
     TaskNode *task_node;
     {
-      MutexGuard lock(pool->queue_mutex);
+      std::unique_lock<std::mutex> lock(pool->queue_mutex);
 
-      while (!pool->stop_flag && !pool->task_queue_head) {
-        pool->condition_var.wait(pool->queue_mutex);
-      }
+      pool->condition_var.wait(lock, [pool] {
+        return pool->stop_flag || pool->task_queue_head != nullptr;
+      });
 
       if (pool->stop_flag) {
         break;

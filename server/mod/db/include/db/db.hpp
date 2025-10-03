@@ -1,6 +1,7 @@
 #pragma once
-#include "MutexGuard/MutexGuard.hpp"
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,7 +15,7 @@ using Value =
 namespace yanhon {
 class db {
 public:
-  db() { pthread_mutex_init(&mutex, nullptr); }
+  db() {}
   bool set(const std::string &key, const Value &value);
   std::optional<Value> get(const std::string &key);
   bool del(const std::string &key);
@@ -22,6 +23,6 @@ public:
 
 private:
   std::unordered_map<std::string, Value> database;
-  pthread_mutex_t mutex;
+  std::shared_mutex mutex;
 };
 } // namespace yanhon

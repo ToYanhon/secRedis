@@ -1,122 +1,156 @@
 #pragma once
 #include <atomic>
 
-#include "MutexGuard/MutexGuard.hpp"
 #include "ThreadPool/ThreadPool.hpp"
 #include "db/db.hpp"
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
 namespace yanhon {
 
 struct ClientBuffer {
-  std::vector<char> data;
-  size_t readOffset = 0;     // 已解析到的位置
-  size_t writeOffset = 0;    // 已写入数据的位置
-  size_t expectedLength = 0; // 期望的消息长度
+  std::vector<char> inBuffer; // 输入缓冲区
+  size_t inReadPos = 0;       // 已解析位置
+  size_t inWritePos = 0;      // 已写入位置
+  size_t expectedLength = 0;  // 期望消息长度
 
-  std::vector<char> outBuffer; // 待发送缓冲区
-  size_t outOffset = 0;        // outBuffer 当前发送位置
+  std::vector<char> outBuffer; // 输出缓冲区
+  size_t outReadPos = 0;       // 已发送位置
 
   static constexpr size_t kInitialSize = 4096;
 
-  mutable pthread_mutex_t mutex;
+  mutable std::shared_mutex rwMutex; // 读写锁支持多读一写
 
   ClientBuffer(size_t initialSize = kInitialSize) {
-    pthread_mutex_init(&mutex, nullptr);
-    data.resize(initialSize);
+    inBuffer.resize(initialSize);
+    outBuffer.reserve(initialSize); // 输出缓冲区预分配空间
   }
 
-  ~ClientBuffer() { pthread_mutex_destroy(&mutex); }
-
-  // 确保 data 可写空间
-  void ensureWritable(size_t n) {
-    if (writeOffset + n > data.size()) {
-      // 如果前面有空闲空间，尝试回收
-      if (readOffset > 0) {
-        size_t readable = readableBytes();
-        memmove(data.data(), data.data() + readOffset, readable);
-        writeOffset = readable;
-        readOffset = 0;
-      }
-      // 如果仍然不足，扩容
-      if (writeOffset + n > data.size()) {
-        data.resize(writeOffset + n);
-      }
-    }
-  }
-
-  // 可读字节数
+  // 输入缓冲区可读字节数
   size_t readableBytes() const {
-    MutexGuard lock(mutex);
-    return writeOffset - readOffset;
+    std::shared_lock<std::shared_mutex> lock(rwMutex);
+    return inWritePos - inReadPos;
   }
 
-  // 当前可读数据指针
+  // 获取可读数据指针（线程安全）
   const char *peek() const {
-    MutexGuard lock(mutex);
-    return data.data() + readOffset;
+    std::shared_lock<std::shared_mutex> lock(rwMutex);
+    return inBuffer.data() + inReadPos;
   }
 
-  // 消费 n 字节
+  // 消费输入缓冲区数据
   void retrieve(size_t n) {
-    MutexGuard lock(mutex);
-    readOffset += n;
-    if (readOffset == writeOffset) {
-      // 数据完全消费，重置偏移并可释放内存
-      readOffset = writeOffset = 0;
-      if (data.capacity() > 4 * kInitialSize) {
-        data.shrink_to_fit();
-        data.resize(kInitialSize);
+    std::unique_lock<std::shared_mutex> lock(rwMutex);
+    inReadPos += n;
+
+    // 当大部分数据已消费时，重置缓冲区
+    if (inReadPos > inBuffer.size() / 2) {
+      size_t remaining = inWritePos - inReadPos;
+      if (remaining > 0) {
+        memmove(inBuffer.data(), inBuffer.data() + inReadPos, remaining);
+      }
+      inReadPos = 0;
+      inWritePos = remaining;
+
+      // 如果缓冲区过大则收缩
+      if (inBuffer.capacity() > 4 * kInitialSize && remaining < kInitialSize) {
+        std::vector<char>(inBuffer.begin(), inBuffer.begin() + remaining)
+            .swap(inBuffer);
       }
     }
   }
 
-  // 写入数据
+  // 写入数据到输入缓冲区
   void append(const char *src, size_t n) {
-    MutexGuard lock(mutex);
+    std::unique_lock<std::shared_mutex> lock(rwMutex);
     ensureWritable(n);
-    std::copy(src, src + n, data.begin() + writeOffset);
-    writeOffset += n;
+    memcpy(inBuffer.data() + inWritePos, src, n);
+    inWritePos += n;
   }
 
-  // 向 outBuffer 写入数据
-  void appendOut(const char *src, size_t n) {
-    MutexGuard lock(mutex);
-    size_t oldSize = outBuffer.size();
-    outBuffer.resize(oldSize + n);
-    memcpy(outBuffer.data() + oldSize, src, n);
-  }
-
-  // 发送完部分 outBuffer 后回收已发送的空间
-  void retrieveOut(size_t n) {
-    MutexGuard lock(mutex);
-    outOffset += n;
-    if (outOffset >= outBuffer.size()) {
-      // 所有数据发送完毕
-      outBuffer.clear();
-      outOffset = 0;
-    } else if (outOffset > outBuffer.size() / 2) {
-      // 已发送数据占据一半以上，移动未发送部分，释放前面空间
-      size_t remaining = outBuffer.size() - outOffset;
-      memmove(outBuffer.data(), outBuffer.data() + outOffset, remaining);
-      outBuffer.resize(remaining);
-      outOffset = 0;
+  // 确保输入缓冲区有足够空间
+  void ensureWritable(size_t n) {
+    if (inWritePos + n > inBuffer.size()) {
+      // 尝试回收前面已读空间
+      if (inReadPos > 0) {
+        size_t readable = inWritePos - inReadPos;
+        if (readable > 0) {
+          memmove(inBuffer.data(), inBuffer.data() + inReadPos, readable);
+        }
+        inWritePos = readable;
+        inReadPos = 0;
+      }
+      // 如果仍然不足则扩容
+      if (inWritePos + n > inBuffer.size()) {
+        inBuffer.resize(std::max(inWritePos + n, inBuffer.size() * 2));
+      }
     }
   }
 
-  // 当前 outBuffer 未发送长度
-  size_t outReadableBytes() const {
-    MutexGuard mg(mutex);
-    return outBuffer.size() - outOffset;
+  // 输出缓冲区相关操作
+  void appendOut(const char *src, size_t n) {
+    // std::unique_lock<std::shared_mutex> lock(rwMutex);
+    // // 直接追加到输出缓冲区，利用vector的扩容策略
+    // outBuffer.insert(outBuffer.end(), src, src + n);
+
+    // 优化版本：预分配空间减少扩容次数
+    std::unique_lock<std::shared_mutex> lock(rwMutex);
+    size_t currentSize = outBuffer.size();
+    size_t requiredSize = currentSize + n;
+
+    if (requiredSize > outBuffer.capacity()) {
+      // 预分配更多空间减少扩容次数
+      outBuffer.reserve(std::max(requiredSize, outBuffer.capacity() * 2));
+    }
+
+    outBuffer.resize(requiredSize);
+    memcpy(outBuffer.data() + currentSize, src, n);
   }
 
-  // 指向当前未发送位置
+  void retrieveOut(size_t n) {
+    std::unique_lock<std::shared_mutex> lock(rwMutex);
+    outReadPos += n;
+
+    // 当大部分数据已发送时，重置输出缓冲区
+    if (outReadPos > outBuffer.size() / 2) {
+      outBuffer.erase(outBuffer.begin(), outBuffer.begin() + outReadPos);
+      outReadPos = 0;
+
+      // 收缩过大的缓冲区
+      if (outBuffer.capacity() > 4 * kInitialSize &&
+          outBuffer.size() < kInitialSize) {
+        outBuffer.shrink_to_fit();
+      }
+    }
+  }
+
+  size_t outReadableBytes() const {
+    std::shared_lock<std::shared_mutex> lock(rwMutex);
+    return outBuffer.size() - outReadPos;
+  }
+
   const char *outPeek() const {
-    MutexGuard mg(mutex);
-    return outBuffer.data() + outOffset;
+    std::shared_lock<std::shared_mutex> lock(rwMutex);
+    return outBuffer.data() + outReadPos;
+  }
+
+  // 批量操作优化：一次性处理多个数据块
+  template <typename Iterator>
+  void appendOutBatch(Iterator begin, Iterator end) {
+    std::unique_lock<std::shared_mutex> lock(rwMutex);
+    size_t totalSize = 0;
+    for (auto it = begin; it != end; ++it) {
+      totalSize += it->size();
+    }
+
+    outBuffer.reserve(outBuffer.size() + totalSize);
+    for (auto it = begin; it != end; ++it) {
+      outBuffer.insert(outBuffer.end(), it->begin(), it->end());
+    }
   }
 };
 
@@ -128,8 +162,8 @@ public:
   void start();
   void stop();
 
-  static const int MAX_EVENTS = 1024;
-  static const int BUFFER_SIZE = 4096;
+  static constexpr int MAX_EVENTS = 1024;
+  static constexpr int BUFFER_SIZE = 4096;
 
 private:
   int listenFd;
@@ -145,16 +179,17 @@ private:
   std::atomic<bool> stopFlag;
 
   std::unordered_map<int, std::shared_ptr<ClientBuffer>> clientBuffers;
-  pthread_mutex_t clientBuffersMutex;
+  std::mutex clientBuffersMutex;
 
   void setNonBlocking(int fd);
-  void serReuseAddr(int fd);
+  void setReuseAddr(int fd);
+  void setSocketOptions(int fd);
 
+  void handleEvents();
   void HandleConnection();
   void HandleClient(int clientFd);
-
-  void doResponse(int clientFd, std::string request);
-  void HandleResp(int clientFd);
+  void processRequest(int clientFd, std::string request);
+  void sendResp(int clientFd);
 };
 
 } // namespace yanhon

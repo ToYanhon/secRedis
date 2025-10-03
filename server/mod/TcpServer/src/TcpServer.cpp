@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <iterator>
+#include <netinet/tcp.h>
 #include <sstream>
 #include <sys/epoll.h>
 #include <unistd.h>
@@ -15,8 +16,6 @@ TcpServer::TcpServer(int port, int threadNum)
   // Initialize server (e.g., create socket, bind, listen)
   ADD_CONSOLE_LOGGER();
   ADD_FILE_LOGGER("server.log");
-
-  pthread_mutex_init(&clientBuffersMutex, nullptr);
 
   LOG_INFO("TcpServer initialized on port " + std::to_string(port) + " with " +
            std::to_string(threadNum) + " threads.");
@@ -35,8 +34,7 @@ void TcpServer::start() {
     return;
   }
 
-  setNonBlocking(listenFd);
-  serReuseAddr(listenFd);
+  setSocketOptions(listenFd);
 
   if (_port <= 0 || _port > 65535) {
     LOG_ERROR("Invalid port number: " + std::to_string(_port));
@@ -78,7 +76,67 @@ void TcpServer::start() {
               std::string(strerror(errno)));
     return;
   }
+  handleEvents();
+}
 
+void TcpServer::stop() {
+  if (stopFlag.load()) {
+    LOG_WARNING("TcpServer already stopped.");
+    return;
+  }
+  {
+    std::unique_lock lock(clientBuffersMutex);
+    for (auto &[fd, buffer] : clientBuffers) {
+      close(fd);
+    }
+    clientBuffers.clear();
+  }
+  stopFlag.store(true);
+  if (epollFd > 0) {
+    close(epollFd);
+  }
+  threadPool.stop();
+  if (listenFd > 0) {
+    close(listenFd);
+  }
+  LOG_INFO("TcpServer on port " + std::to_string(_port) + " has been stopped.");
+}
+
+// 工具函数
+void TcpServer::setNonBlocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  auto rt = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  if (rt == -1) {
+    LOG_ERROR("Failed to set non-blocking mode." +
+              std::string(strerror(errno)));
+  }
+}
+
+void TcpServer::setReuseAddr(int fd) {
+  int opt = 1;
+  auto rt = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  if (rt == -1) {
+    LOG_ERROR("Failed to set SO_REUSEADDR." + std::string(strerror(errno)));
+  }
+}
+
+void TcpServer::setSocketOptions(int fd) {
+  setReuseAddr(fd);
+
+  // 设置TCP_NODELAY禁用Nagle算法
+  int opt = 1;
+  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+    LOG_WARNING("Failed to set TCP_NODELAY: " + std::string(strerror(errno)));
+  }
+
+  // 设置KeepAlive
+  opt = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) < 0) {
+    LOG_WARNING("Failed to set SO_KEEPALIVE: " + std::string(strerror(errno)));
+  }
+}
+
+void TcpServer::handleEvents() {
   while (!stopFlag.load()) {
     struct epoll_event events[MAX_EVENTS];
     int n = epoll_wait(epollFd, events, MAX_EVENTS, -1);
@@ -93,48 +151,18 @@ void TcpServer::start() {
         threadPool.enqueue(std::bind(&TcpServer::HandleClient, this, clientFd));
       } else if (events[i].events & EPOLLOUT) {
         int fd = events[i].data.fd;
-        threadPool.enqueue(std::bind(&TcpServer::HandleResp, this, fd));
+        threadPool.enqueue(std::bind(&TcpServer::sendResp, this, fd));
       } else {
         // Other events (e.g., error)
         int clientFd = events[i].data.fd;
         LOG_ERROR("Epoll error on fd " + std::to_string(clientFd));
         close(clientFd);
         {
-          MutexGuard lock(clientBuffersMutex);
+          std::lock_guard<std::mutex> lg(clientBuffersMutex);
           clientBuffers.erase(clientFd);
         }
       }
     }
-  }
-}
-
-void TcpServer::stop() {
-  if (stopFlag.load()) {
-    LOG_WARNING("TcpServer is already stopped.");
-    return;
-  }
-  stopFlag.store(true);
-  close(epollFd);
-  threadPool.stop();
-  close(listenFd);
-  LOG_INFO("TcpServer on port " + std::to_string(_port) + " has been stopped.");
-  pthread_mutex_destroy(&clientBuffersMutex);
-}
-
-void TcpServer::setNonBlocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  auto rt = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-  if (rt == -1) {
-    LOG_ERROR("Failed to set non-blocking mode." +
-              std::string(strerror(errno)));
-  }
-}
-
-void TcpServer::serReuseAddr(int fd) {
-  int opt = 1;
-  auto rt = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  if (rt == -1) {
-    LOG_ERROR("Failed to set SO_REUSEADDR." + std::string(strerror(errno)));
   }
 }
 
@@ -147,7 +175,7 @@ void TcpServer::HandleConnection() {
     if (connFd >= 0) {
       setNonBlocking(connFd);
       struct epoll_event connEvent;
-      connEvent.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+      connEvent.events = EPOLLIN | EPOLLET;
       connEvent.data.fd = connFd;
 
       if (epoll_ctl(epollFd, EPOLL_CTL_ADD, connFd, &connEvent) < 0) {
@@ -176,7 +204,7 @@ void TcpServer::HandleClient(int clientFd) {
 
   std::shared_ptr<ClientBuffer> clientBuffer;
   {
-    MutexGuard lock(clientBuffersMutex);
+    std::lock_guard<std::mutex> lg(clientBuffersMutex);
 
     auto [it, _] =
         clientBuffers.emplace(clientFd, std::make_shared<ClientBuffer>());
@@ -205,16 +233,20 @@ void TcpServer::HandleClient(int clientFd) {
             epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
             close(clientFd);
             {
-              MutexGuard lock(clientBuffersMutex);
+              std::lock_guard<std::mutex> lg(clientBuffersMutex);
               clientBuffers.erase(clientFd);
             }
             return;
           }
         }
         if (clientBuffer->readableBytes() >= expectedLength) {
-          threadPool.enqueue(
-              std::bind(&TcpServer::doResponse, this, clientFd,
-                        std::string(clientBuffer->peek(), expectedLength)));
+          // threadPool.enqueue(
+          //     std::bind(&TcpServer::processRequest, this, clientFd,
+          //               std::string(clientBuffer->peek(), expectedLength)));
+          threadPool.enqueue(std::bind(
+              &TcpServer::processRequest, this, clientFd,
+              std::move(std::string(clientBuffer->peek(), expectedLength))));
+
           clientBuffer->retrieve(expectedLength);
           expectedLength = 0;
         }
@@ -230,21 +262,13 @@ void TcpServer::HandleClient(int clientFd) {
       close(clientFd);
       LOG_INFO("Client disconnected.");
       {
-        MutexGuard lock(clientBuffersMutex);
+        std::lock_guard<std::mutex> lg(clientBuffersMutex);
         clientBuffers.erase(clientFd);
       }
 
       break;
     } else {
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-        ev.data.fd = clientFd;
-        auto rt = epoll_ctl(epollFd, EPOLL_CTL_MOD, clientFd, &ev);
-        if (rt == -1) {
-          LOG_ERROR("Failed to modify clientFd in epoll." +
-                    std::string(strerror(errno)));
-        }
         // No more data to read
         break;
       } else {
@@ -256,7 +280,7 @@ void TcpServer::HandleClient(int clientFd) {
         }
         close(clientFd);
         {
-          MutexGuard lock(clientBuffersMutex);
+          std::lock_guard<std::mutex> lg(clientBuffersMutex);
           clientBuffers.erase(clientFd);
         }
         break;
@@ -266,7 +290,7 @@ void TcpServer::HandleClient(int clientFd) {
 }
 
 // set,del,get,exists 命令
-void TcpServer::doResponse(int clientFd, std::string request) {
+void TcpServer::processRequest(int clientFd, std::string request) {
   std::istringstream iss(request);
   std::vector<std::string> tokens{std::istream_iterator<std::string>{iss},
                                   std::istream_iterator<std::string>{}};
@@ -280,36 +304,54 @@ void TcpServer::doResponse(int clientFd, std::string request) {
       c = std::toupper(c); // 忽略大小写
 
     if (cmd == "SET") {
-      if (tokens.size() < 3) {
+      auto n = tokens.size();
+      if (n < 3) {
         response << "ERR wrong number of arguments for 'SET'";
       } else {
         const std::string &key = tokens[1];
 
+        std::string str = tokens[2];
+        for (auto &c : str) {
+          c = std::toupper(c);
+        }
+
         // 检查是否有类型指示符
-        if (tokens[2] == "MAP") {
+        if (str == "MAP") {
           // 处理 map 类型
-          if (tokens.size() < 4 || tokens.size() % 2 != 0) {
+          if (tokens.size() < 5 || tokens.size() % 2 == 0) {
             response << "ERR wrong number of arguments for map";
           } else {
             std::unordered_map<std::string, std::string> map;
+            auto val = database.get(key);
+            if (val &&
+                std::holds_alternative<
+                    std::unordered_map<std::string, std::string>>(*val)) {
+              map =
+                  std::get<std::unordered_map<std::string, std::string>>(*val);
+            }
             for (size_t i = 3; i < tokens.size(); i += 2) {
               map[tokens[i]] = tokens[i + 1];
             }
-            database.set(key, map);
+            database.set(key, std::move(map));
             response << "OK";
             LOG_INFO("SET map key: " + key + " with " +
                      std::to_string(map.size()) + " elements");
           }
-        } else if (tokens[2] == "SET") {
+        } else if (str == "SET") {
           // 处理 set 类型
           if (tokens.size() < 4) {
             response << "ERR wrong number of arguments for set";
           } else {
             std::unordered_set<std::string> set;
+            auto val = database.get(key);
+            if (val &&
+                std::holds_alternative<std::unordered_set<std::string>>(*val)) {
+              set = std::get<std::unordered_set<std::string>>(*val);
+            }
             for (size_t i = 3; i < tokens.size(); i++) {
               set.insert(tokens[i]);
             }
-            database.set(key, set);
+            database.set(key, std::move(set));
             response << "OK";
             LOG_INFO("SET set key: " + key + " with " +
                      std::to_string(set.size()) + " elements");
@@ -317,15 +359,13 @@ void TcpServer::doResponse(int clientFd, std::string request) {
         } else {
           // 默认处理为字符串类型
           // 将所有剩余 token 连接起来作为值
-          std::string value;
-          for (size_t i = 2; i < tokens.size(); i++) {
-            if (i > 2)
-              value += " ";
-            value += tokens[i];
+          if (n != 3) {
+            response << "ERR PARA NUMS";
+          } else {
+            database.set(key, tokens[2]);
+            response << "OK";
+            LOG_INFO("SET string key: " + key + ", value: " + tokens[2]);
           }
-          database.set(key, value);
-          response << "OK";
-          LOG_INFO("SET string key: " + key + ", value: " + value);
         }
       }
     } else if (cmd == "GET") {
@@ -403,7 +443,7 @@ void TcpServer::doResponse(int clientFd, std::string request) {
 
   std::shared_ptr<ClientBuffer> clientBuffer;
   {
-    MutexGuard lock(clientBuffersMutex);
+    std::lock_guard<std::mutex> lg(clientBuffersMutex);
     auto it = clientBuffers.find(clientFd);
     if (it == clientBuffers.end()) {
       LOG_ERROR("Client buffer not found for fd " + std::to_string(clientFd));
@@ -421,15 +461,15 @@ void TcpServer::doResponse(int clientFd, std::string request) {
 
   // 修改 epoll 事件，监听 EPOLLOUT
   struct epoll_event ev;
-  ev.events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLONESHOT;
+  ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
   ev.data.fd = clientFd;
   epoll_ctl(epollFd, EPOLL_CTL_MOD, clientFd, &ev);
 }
 
-void TcpServer::HandleResp(int clientFd) {
+void TcpServer::sendResp(int clientFd) {
   std::shared_ptr<ClientBuffer> clientBuffer;
   {
-    MutexGuard lock(clientBuffersMutex);
+    std::lock_guard<std::mutex> lg(clientBuffersMutex);
     auto it = clientBuffers.find(clientFd);
     if (it == clientBuffers.end()) {
       // No buffer found, nothing to send
@@ -453,7 +493,7 @@ void TcpServer::HandleResp(int clientFd) {
       epoll_ctl(epollFd, EPOLL_CTL_DEL, clientFd, nullptr);
       close(clientFd);
       {
-        MutexGuard lock(clientBuffersMutex);
+        std::lock_guard<std::mutex> lg(clientBuffersMutex);
         clientBuffers.erase(clientFd);
       }
       return;
@@ -463,7 +503,7 @@ void TcpServer::HandleResp(int clientFd) {
   // 如果数据发送完毕，修改事件只监听 EPOLLIN
   if (clientBuffer->outBuffer.empty()) {
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+    ev.events = EPOLLIN | EPOLLET;
     ev.data.fd = clientFd;
     auto rt = epoll_ctl(epollFd, EPOLL_CTL_MOD, clientFd, &ev);
     if (rt == -1) {

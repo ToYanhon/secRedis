@@ -20,25 +20,21 @@ FileSink::~FileSink() {
   }
 }
 
-LoggerManager::LoggerManager() : id(1) {
-  pthread_mutex_init(&map_mutex, nullptr);
-}
+LoggerManager::LoggerManager() : id(1) {}
 
 LoggerManager::~LoggerManager() {
   {
-    MutexGuard mg(map_mutex);
+    std::lock_guard mg(map_mutex);
     for (auto &[_, sink] : vec) {
       delete sink;
     }
     vec.clear();
   }
-
-  pthread_mutex_destroy(&map_mutex);
 }
 
 unsigned long long LoggerManager::add(Sink *sink) {
   if (sink != nullptr) {
-    MutexGuard mg(map_mutex);
+    std::lock_guard mg(map_mutex);
     vec[id] = sink;
     return id++;
   }
@@ -47,7 +43,7 @@ unsigned long long LoggerManager::add(Sink *sink) {
 
 void LoggerManager::remove(unsigned long long id) {
   if (vec.count(id)) {
-    MutexGuard mg(map_mutex);
+    std::lock_guard mg(map_mutex);
     vec.erase(id);
   }
 }
@@ -62,7 +58,7 @@ void LoggerManager::write(LOG_LEVEL level, const std::string &msg,
   }
   std::string format_msg = format(level, msg, curr_time, short_file, lines);
 
-  MutexGuard mg(map_mutex);
+  std::lock_guard mg(map_mutex);
   for (auto &[_, sink] : vec) {
     sink->write(format_msg);
   }

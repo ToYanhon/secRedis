@@ -4,6 +4,5 @@ target_include_directories(db PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 target_link_libraries(db PUBLIC 
-    MutexGuard
     Logger
 )

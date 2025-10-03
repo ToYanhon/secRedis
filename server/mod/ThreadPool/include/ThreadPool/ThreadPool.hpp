@@ -1,10 +1,9 @@
 #pragma once
-#include <pthread.h>
-
 #include <atomic>
+#include <condition_variable>
 #include <functional>
-
-#include "Cond/Cond.hpp"
+#include <mutex>
+#include <thread>
 
 namespace yanhon {
 
@@ -22,11 +21,11 @@ public:
 private:
   static void *worker(void *arg);
 
-  pthread_t *threads;
+  std::thread *threads;
   int num_threads;
   std::atomic<bool> stop_flag;
-  pthread_mutex_t queue_mutex;
-  Cond condition_var;
+  std::mutex queue_mutex;
+  std::condition_variable condition_var;
 
   struct TaskNode {
     std::function<void()> task;
